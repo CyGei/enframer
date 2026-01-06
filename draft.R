@@ -2,6 +2,7 @@
 #           Data Load
 # ------------------------------------
 library(purrr)
+library(tibble)
 library(tidytable)
 library(arrow)
 library(ggplot2)
@@ -126,106 +127,108 @@ dev.off()
 
 
 # ------------------------------------
-#           Filter Methods
+#       Imputation Pipeline
 # ------------------------------------
-# Rows are weeks, Columns are locations
-
-# Define your filters
-filters <- list(
-  # Each column must have at least X % of data observed
-  col_prop_all = function(mat, prop = 0.5) {
-    all(apply(mat, 2, function(v) mean(!is.na(v))) >= prop)
-  },
-  # At least one column must have at least X % of data observed
-  col_prop_any = function(mat, prop = 0.5) {
-    any(apply(mat, 2, function(v) mean(!is.na(v))) >= prop)
-  },
-  # Must observe at least X consecutive weeks per column
-  col_rle = function(mat, len = 10) {
-    all(apply(mat, 2, function(v) {
-      rle_v <- rle(!is.na(v))
-      any(rle_v$values & rle_v$lengths >= len)
-    }))
-  }
-)
-
-framelist_filtered <- map_dfc(
-  filters,
-  ~ map_lgl(framelist$mat, .x)
-) |>
-  (\(x) bind_cols(framelist, x))()
-
-
-# ------------------------------------
-#           Imputation Methods
-# ------------------------------------
-library(softImpute)
 library(imputeTS)
+library(softImpute)
 library(missForest)
 library(mice)
 
-imputers <- list(
-  zeros = function(mat) {
-    mat[is.na(mat)] <- 0
-    mat
-  },
-  linear = function(mat) {
-    apply(mat, 2, imputeTS::na_interpolation, option = "linear")
-  },
-  kalman = function(mat) {
-    apply(mat, 2, imputeTS::na_kalman) |> as.matrix()
-  },
-  softimpute = function(mat) {
-    fit <- softImpute::softImpute(mat, rank.max = 10)
-    softImpute::complete(mat, fit)
-  },
-  missforest = function(mat) {
-    missForest::missForest(mat)$ximp
-  }
-)
-
-x = framelist_filtered |> filter(col_rle) |> slice_sample(n = 10)
-
-framelist_imputed <- map_dfc(names(imputers), function(name) {
-  mat_list <- map(framelist_filtered$mat, imputers[[name]])
-  tibble::tibble(!!name := mat_list)
-}) |>
-  (\(x) bind_cols(framelist_filtered, x))()
-
-plot_frame <- function(frame) {
-  plot_df <- frame |>
-    as.data.frame() |>
-    tibble::rownames_to_column("row") |>
-    pivot_longer(-row, names_to = "col", values_to = "value") |>
-    mutate(
-      row = factor(row, levels = row_levels),
-      col = factor(col, levels = col_levels)
-    )
-
-  ggplot(plot_df, aes(x = row, y = col, fill = value)) +
-    geom_tile() +
-    scale_fill_gradient2(
-      low = "midnightblue",
-      mid = "white",
-      high = "firebrick",
-      midpoint = 0,
-    ) +
-    theme_classic()
+# --------- dianostics ---------
+frame_diagnostics <- function(mat) {
+  tibble(
+    n_obs_total = sum(!is.na(mat)),
+    min_obs_per_col = min(colSums(!is.na(mat))),
+    max_run_per_col = min(apply(mat, 2, function(v) {
+      r <- rle(!is.na(v))
+      if (any(r$values)) max(r$lengths[r$values]) else 0
+    })),
+    prop_obs_min_col = min(colMeans(!is.na(mat)))
+  )
 }
 
-framelist_imputed |>
-  slice(1) |>
-  pluck("mat", 1) |>
-  plot_frame() +
-  ggtitle("Original")
+# --------- Imputer Definitions ---------
+nonneg <- function(mat) {
+  mat[mat < 0] <- 0
+  mat
+}
 
-map(
-  names(imputers),
-  function(name) {
-    framelist_imputed |>
-      slice(1) |>
-      pluck(name, 1) |>
-      plot_frame() +
-      ggtitle(paste("Imputation method:", name))
-  }
+imputers <- list(
+  zeros = list(
+    requires = function(d) TRUE,
+    impute = function(mat) {
+      mat[is.na(mat)] <- 0
+      mat
+    }
+  ),
+  linear = list(
+    requires = function(d) d$min_obs_per_col >= 2,
+    impute = function(mat) {
+      apply(mat, 2, na_interpolation, option = "linear") |> nonneg()
+    }
+  ),
+  kalman = list(
+    requires = function(d) d$min_obs_per_col >= 2,
+    impute = function(mat) apply(mat, 2, na_kalman) |> nonneg()
+  ),
+  softimpute = list(
+    requires = function(d) d$n_obs_total > 0,
+    impute = function(mat) {
+      fit <- softImpute::softImpute(mat, rank.max = 10)
+      softImpute::complete(mat, fit) |> nonneg()
+    }
+  ),
+  missforest = list(
+    requires = function(d) d$min_obs_per_col >= 1,
+    impute = function(mat) missForest::missForest(mat)$ximp |> nonneg()
+  )
 )
+
+activate_imputers <- function(d) {
+  map_lgl(imputers, \(imp) imp$requires(d))
+}
+
+
+apply_imputers <- function(mat, active) {
+  imap(imputers, \(imp, name) {
+    if (!active[[name]]) {
+      return(NULL)
+    }
+    imp$impute(mat)
+  })
+}
+
+
+impute_framelist <- function(framelist) {
+  framelist |>
+    mutate(
+      diagnostics = map(mat, frame_diagnostics),
+      active_imputers = map(diagnostics, activate_imputers),
+      imputed = map2(mat, active_imputers, apply_imputers)
+    )
+}
+
+# --------- usage ---------
+framelist_imputed <- impute_framelist(framelist)
+
+framelist_imputed |>
+  slice(n = 1) |>
+  pluck("imputed", 1) |>
+  pluck("softimpute") |>
+  plot_frame()
+
+
+framelist_imputed |>
+  slice(3114) |>
+  pluck("imputed", 1) |>
+  imap(\(mat, method) {
+    # plot only non-NULL imputations
+    if (is.null(mat)) {
+      return(NULL)
+    } else {
+      plot_frame(mat) +
+        ggtitle(paste("Imputation:", method))
+    }
+  }) |>
+  compact() |>
+  patchwork::wrap_plots(guides = 'collect')
