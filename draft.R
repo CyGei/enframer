@@ -219,7 +219,7 @@ framelist_imputed |>
 
 
 framelist_imputed |>
-  slice(3114) |>
+  slice(3113) |>
   pluck("imputed", 1) |>
   imap(\(mat, method) {
     # plot only non-NULL imputations
